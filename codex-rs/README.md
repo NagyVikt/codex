@@ -53,6 +53,60 @@ You can enable notifications by configuring a script that is run whenever the ag
 To run Codex non-interactively, run `codex exec PROMPT` (you can also pass the prompt via `stdin`) and Codex will work on your task until it decides that it is done and exits. Output is printed to the terminal directly. You can set the `RUST_LOG` environment variable to see more about what's going on.
 Use `codex exec --ephemeral ...` to run without persisting session rollout files to disk.
 
+### `codex commander` to chain multiple worker roles
+
+Use `codex commander` when you want one command to coordinate multiple worker roles over the same task. Workers run sequentially, and each worker receives previous worker outputs as handoff context.
+
+```shell
+codex commander \
+  --task "Build a release plan for adding offline cache support" \
+  --worker planner="Draft an implementation plan with milestones" \
+  --worker coder="Convert the plan into concrete code changes" \
+  --worker reviewer="Review risks and missing tests"
+```
+
+Run `codex commander` with no task/workers to open the interactive commander prompt (you can still force it with `--shell`):
+
+```shell
+codex commander \
+  --task "Build a release plan for adding offline cache support" \
+  --worker planner="Draft an implementation plan with milestones" \
+  --worker coder="Convert the plan into concrete code changes" \
+  --shell
+
+# In the commander shell:
+/task Build a release plan for adding offline cache support
+/workers
+/tree
+/results
+/help
+/quit
+```
+
+You can also start empty and manage everything inside the commander shell:
+
+```shell
+codex commander --shell
+
+# In the commander shell:
+/task Build a release plan for adding offline cache support
+# Optional: customize workers before running
+/add-worker planner=Draft an implementation plan with milestones
+/add worker coder=Convert the plan into concrete code changes
+# /task automatically starts planning + execution
+/workers
+/tree
+/results
+```
+
+The shell header and prompt show worker progress (for example `2/3 running`), and `/tree` prints the worker execution tree.
+
+By default, `/task` and `/run` automatically improve the task prompt and split it into subtasks before assigning work one-by-one across workers. Use `--no-plan` to skip that behavior.
+
+If you do not define workers, commander auto-creates `worker-N` workers based on subtask count. If you do not define a `reviewer` worker, commander automatically adds one at run time to review outputs.
+
+When a run starts, commander prints the generated plan, execution tree, and live per-worker progress updates (including elapsed time) while each worker/reviewer is running.
+
 ### Experimenting with the Codex Sandbox
 
 To test to see what happens when a command is run under the sandbox provided by Codex, we provide the following subcommands in Codex CLI:

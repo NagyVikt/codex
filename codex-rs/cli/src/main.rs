@@ -33,12 +33,14 @@ use supports_color::Stream;
 
 #[cfg(target_os = "macos")]
 mod app_cmd;
+mod commander_cmd;
 #[cfg(target_os = "macos")]
 mod desktop_app;
 mod mcp_cmd;
 #[cfg(not(windows))]
 mod wsl_paths;
 
+use crate::commander_cmd::CommanderCli;
 use crate::mcp_cmd::McpCli;
 
 use codex_core::config::Config;
@@ -95,6 +97,9 @@ enum Subcommand {
 
     /// Manage external MCP servers for Codex.
     Mcp(McpCli),
+
+    /// Coordinate multiple Codex workers from one command.
+    Commander(CommanderCli),
 
     /// Start Codex as an MCP server (stdio).
     McpServer,
@@ -593,6 +598,9 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
             // Propagate any root-level config overrides (e.g. `-c key=value`).
             prepend_config_flags(&mut mcp_cli.config_overrides, root_config_overrides.clone());
             mcp_cli.run().await?;
+        }
+        Some(Subcommand::Commander(commander_cli)) => {
+            commander_cmd::run(commander_cli, root_config_overrides).await?;
         }
         Some(Subcommand::AppServer(app_server_cli)) => match app_server_cli.subcommand {
             None => {
@@ -1406,6 +1414,90 @@ mod tests {
             panic!("expected features disable");
         };
         assert_eq!(feature, "shell_tool");
+    }
+
+    #[test]
+    fn commander_parses_worker_specs_and_task() {
+        let cli = MultitoolCli::try_parse_from([
+            "codex",
+            "commander",
+            "--task",
+            "Add a commander feature",
+            "--worker",
+            "planner=Draft implementation plan",
+            "--worker",
+            "coder=Implement the plan",
+            "--model",
+            "gpt-5.2-codex",
+        ])
+        .expect("parse should succeed");
+        let Some(Subcommand::Commander(commander)) = cli.subcommand else {
+            panic!("expected commander subcommand");
+        };
+
+        assert_eq!(commander.task.as_deref(), Some("Add a commander feature"));
+        assert_eq!(
+            commander.worker_specs,
+            vec![
+                "planner=Draft implementation plan".to_string(),
+                "coder=Implement the plan".to_string(),
+            ]
+        );
+        assert_eq!(commander.model.as_deref(), Some("gpt-5.2-codex"));
+        assert_eq!(commander.config_profile, None);
+        assert!(!commander.full_auto);
+        assert!(!commander.dangerously_bypass_approvals_and_sandbox);
+        assert!(!commander.json);
+        assert!(!commander.shell);
+        assert_eq!(commander.task_file, None);
+        assert!(commander.worker_files.is_empty());
+        assert!(commander.env.is_empty());
+        assert!(!commander.no_auto_reviewer);
+        assert_eq!(commander.reviewer_instructions, None);
+        assert!(!commander.finalize);
+        assert_eq!(commander.timeout_secs, None);
+        assert_eq!(commander.retries, 0);
+        assert!(!commander.continue_on_failure);
+        assert_eq!(commander.previous_outputs, None);
+        assert_eq!(commander.max_context_chars, None);
+        assert_eq!(commander.output_dir, None);
+        assert!(!commander.save_prompts);
+        assert!(!commander.write_report);
+        assert!(!commander.stream);
+        assert!(!commander.dry_run);
+        assert_eq!(commander.load_session, None);
+        assert_eq!(commander.save_session, None);
+    }
+
+    #[test]
+    fn commander_shell_parses_without_task_or_workers() {
+        let cli = MultitoolCli::try_parse_from(["codex", "commander", "--shell"])
+            .expect("parse should succeed");
+        let Some(Subcommand::Commander(commander)) = cli.subcommand else {
+            panic!("expected commander subcommand");
+        };
+
+        assert_eq!(commander.task, None);
+        assert_eq!(commander.task_file, None);
+        assert!(commander.worker_specs.is_empty());
+        assert!(commander.worker_files.is_empty());
+        assert!(commander.shell);
+        assert!(!commander.no_auto_reviewer);
+    }
+
+    #[test]
+    fn commander_shell_conflicts_with_json() {
+        let result = MultitoolCli::try_parse_from([
+            "codex",
+            "commander",
+            "--task",
+            "Add a commander feature",
+            "--worker",
+            "planner=Draft implementation plan",
+            "--json",
+            "--shell",
+        ]);
+        assert!(result.is_err());
     }
 
     #[test]
