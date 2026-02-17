@@ -1373,7 +1373,15 @@ async fn run_commander_shell(
                     println!("Task updated {task_summary}.");
                 }
                 Err(err) => {
-                    eprintln!("Failed to paste clipboard image: {err}");
+                    let marker = append_image_marker_to_task(session, None);
+                    let updated_task = session.task.as_deref().unwrap_or_default();
+                    let task_summary = summarize_task_input(updated_task);
+                    println!("Clipboard image paste failed: {err}");
+                    println!("Attached fallback marker: {marker}");
+                    println!("Task updated {task_summary}.");
+                    println!(
+                        "Tip: use /attach-image /path/to/file.png if clipboard access is blocked."
+                    );
                 }
             },
             CommanderShellCommand::AddWorker(spec) => match parse_worker_definition(&spec) {
@@ -1966,7 +1974,7 @@ fn footer_input_rows(rows: usize) -> usize {
 
 async fn reset_shell_surface(stdout: &mut tokio::io::Stdout) -> anyhow::Result<()> {
     stdout
-        .write_all(b"\x1b[0m\x1b[?2004l\x1b[2J\x1b[H")
+        .write_all(b"\x1b[0m\x1b[?2004h\x1b[2J\x1b[H")
         .await
         .context("failed to clear commander shell surface")?;
     stdout
@@ -1992,14 +2000,14 @@ async fn read_shell_input_with_paste_support(
     first_line: String,
 ) -> anyhow::Result<String> {
     let (has_start, has_end, normalized) = split_bracketed_paste_markers(&first_line);
-    if !has_start {
+    if has_start && has_end {
         return Ok(normalized);
     }
-    if has_end {
+    if !has_start && normalized.trim_start().starts_with('/') {
         return Ok(normalized);
     }
 
-    if normalized.trim_start().starts_with('/') {
+    if has_start && normalized.trim_start().starts_with('/') {
         return Ok(normalized);
     }
 
