@@ -2,8 +2,8 @@ use anyhow::Context;
 use anyhow::bail;
 use clap::ArgAction;
 use clap::Parser;
-use codex_utils_cli::CliConfigOverrides;
 use codex_tui::paste_image_to_temp_png;
+use codex_utils_cli::CliConfigOverrides;
 use serde_json::json;
 use std::collections::HashSet;
 use std::path::Path;
@@ -2003,11 +2003,11 @@ async fn read_shell_input_with_paste_support(
         return Ok(normalized);
     }
 
-        let mut collected = normalized;
-        let is_burst_collection = !has_start;
+    let mut collected = normalized;
+    let is_burst_collection = !has_start;
 
     loop {
-            let next_line = if is_burst_collection {
+        let next_line = if is_burst_collection {
             match timeout(
                 std::time::Duration::from_millis(PASTE_BURST_IDLE_MS),
                 lines.next_line(),
