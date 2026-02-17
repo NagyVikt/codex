@@ -3,6 +3,7 @@ use anyhow::bail;
 use clap::ArgAction;
 use clap::Parser;
 use codex_utils_cli::CliConfigOverrides;
+use codex_tui::paste_image_to_temp_png;
 use serde_json::json;
 use std::collections::HashSet;
 use std::path::Path;
@@ -14,6 +15,7 @@ use tempfile::NamedTempFile;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
+use tokio::time::timeout;
 
 /// Run and coordinate multiple Codex workers.
 ///
@@ -94,6 +96,7 @@ pub struct CommanderCli {
     /// Supported slash commands:
     /// `/task`, `/add-worker`, `/remove-worker`, `/run`, `/workers`, `/tree`,
     /// `/results`, `/show`, `/config`, `/save`, `/load`, `/clear-results`,
+    /// `/image`, `/attach-image`, `/image-paste`,
     /// `/set-model`, `/set-profile`, `/toggle-full-auto`, `/toggle-yolo`,
     /// `/set-timeout`, `/set-retries`, `/toggle-continue-on-failure`,
     /// `/toggle-auto-reviewer`, `/toggle-finalize`, `/set-output-dir`,
@@ -381,6 +384,8 @@ struct CommanderSession {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CommanderShellCommand {
     Task(String),
+    AttachImage(Option<String>),
+    PasteClipboardImage,
     AddWorker(String),
     RemoveWorker(String),
     Run,
@@ -1285,12 +1290,15 @@ async fn run_commander_shell(
     root_config_overrides: &CliConfigOverrides,
     codex_bin: &Path,
 ) -> anyhow::Result<()> {
+    let mut stdout = tokio::io::stdout();
+    reset_shell_surface(&mut stdout).await?;
+
     println!("Commander shell started. Use /help for commands.");
+    println!("Type a task directly (no /task needed).");
     print_shell_dashboard(session);
 
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();
-    let mut stdout = tokio::io::stdout();
 
     loop {
         let prompt = shell_prompt(session);
@@ -1314,7 +1322,7 @@ async fn run_commander_shell(
             .context("failed to read commander command")?
         else {
             stdout
-                .write_all(b"\x1b[0m")
+                .write_all(b"\x1b[0m\x1b[?2004l")
                 .await
                 .context("failed to reset terminal style")?;
             println!();
@@ -1325,14 +1333,49 @@ async fn run_commander_shell(
             .await
             .context("failed to reset terminal style")?;
 
-        match parse_shell_command(&input) {
+        let normalized = read_shell_input_with_paste_support(&mut lines, input).await?;
+        match parse_shell_command(&normalized) {
             CommanderShellCommand::Task(task) => {
                 let task_summary = summarize_task_input(&task);
+                if let Some(preview) = summarize_large_task_preview(&task) {
+                    println!("Task input: {preview}");
+                }
                 session.task = Some(task);
                 session.worker_outputs.clear();
                 refresh_session_worker_states(session);
                 println!("Task updated {task_summary}.");
             }
+            CommanderShellCommand::AttachImage(path) => {
+                let marker = append_image_marker_to_task(session, path.as_deref());
+                let updated_task = session.task.as_deref().unwrap_or_default();
+                let task_summary = summarize_task_input(updated_task);
+                if let Some(preview) = summarize_large_task_preview(updated_task) {
+                    println!("Task input: {preview}");
+                }
+                println!("Attached image marker: {marker}");
+                println!("Task updated {task_summary}.");
+            }
+            CommanderShellCommand::PasteClipboardImage => match paste_image_to_temp_png() {
+                Ok((path, info)) => {
+                    let path_display = path.display().to_string();
+                    let marker = append_image_marker_to_task(session, Some(&path_display));
+                    let updated_task = session.task.as_deref().unwrap_or_default();
+                    let task_summary = summarize_task_input(updated_task);
+                    if let Some(preview) = summarize_large_task_preview(updated_task) {
+                        println!("Task input: {preview}");
+                    }
+                    println!(
+                        "Attached clipboard image: {}x{} {} -> {marker}",
+                        info.width,
+                        info.height,
+                        info.encoded_format.label()
+                    );
+                    println!("Task updated {task_summary}.");
+                }
+                Err(err) => {
+                    eprintln!("Failed to paste clipboard image: {err}");
+                }
+            },
             CommanderShellCommand::AddWorker(spec) => match parse_worker_definition(&spec) {
                 Ok(worker) => {
                     let worker_name = worker.name.clone();
@@ -1495,7 +1538,11 @@ async fn run_commander_shell(
             }
             CommanderShellCommand::Help => {
                 println!("Available commands:");
+                println!("(plain text without / is treated as /task <text>)");
                 println!("/task <text> - set shared task");
+                println!("/image [path] - paste clipboard image (no path) or attach path marker");
+                println!("/attach-image [path] - append image marker without clipboard paste");
+                println!("/image-paste - paste image from clipboard via Codex core pipeline");
                 println!("/add-worker <name>=<instructions> - add or update worker");
                 println!("/remove-worker <name> - remove worker");
                 println!("/run - execute all workers in sequence");
@@ -1529,10 +1576,21 @@ async fn run_commander_shell(
                 eprintln!("{message}");
             }
             CommanderShellCommand::Unknown(command) => {
-                eprintln!("Unknown command: {command}. Use /help.");
+                eprintln!(
+                    "Unknown command: {command}. Use /help. If this is a task, type it without a leading '/'."
+                );
             }
         }
     }
+
+    stdout
+        .write_all(b"\x1b[0m\x1b[?2004l")
+        .await
+        .context("failed to restore terminal paste mode")?;
+    stdout
+        .flush()
+        .await
+        .context("failed to flush terminal paste mode restore")?;
 
     Ok(())
 }
@@ -1556,6 +1614,27 @@ fn parse_shell_command(input: &str) -> CommanderShellCommand {
                 CommanderShellCommand::UsageError("Usage: /task <task text>".to_string())
             } else {
                 CommanderShellCommand::Task(args.to_string())
+            }
+        }
+        "/image" => {
+            if args.is_empty() {
+                CommanderShellCommand::PasteClipboardImage
+            } else {
+                CommanderShellCommand::AttachImage(Some(args.to_string()))
+            }
+        }
+        "/attach-image" => {
+            if args.is_empty() {
+                CommanderShellCommand::AttachImage(None)
+            } else {
+                CommanderShellCommand::AttachImage(Some(args.to_string()))
+            }
+        }
+        "/image-paste" | "/paste-image" => {
+            if args.is_empty() {
+                CommanderShellCommand::PasteClipboardImage
+            } else {
+                CommanderShellCommand::UsageError("Usage: /image-paste".to_string())
             }
         }
         "/add-worker" => {
@@ -1739,7 +1818,21 @@ fn shell_prompt(session: &CommanderSession) -> String {
     format!("› [{progress_title}] ")
 }
 
-const DASHBOARD_BOX_WIDTH: usize = 48;
+const DASHBOARD_BOX_WIDTH_DEFAULT: usize = 58;
+const DASHBOARD_BOX_WIDTH_MIN: usize = 48;
+const DASHBOARD_BOX_WIDTH_MAX: usize = 76;
+const STYLED_FOOTER_MIN_ROWS: usize = 18;
+const PASTED_PREVIEW_MIN_CHARS: usize = 50;
+const PASTE_BURST_IDLE_MS: u64 = 120;
+const BRACKETED_PASTE_START: &str = "\u{1b}[200~";
+const BRACKETED_PASTE_END: &str = "\u{1b}[201~";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DashboardLayout {
+    Full,
+    Compact,
+    Minimal,
+}
 
 fn truncate_for_box(text: &str, max_chars: usize) -> String {
     let count = text.chars().count();
@@ -1753,8 +1846,43 @@ fn truncate_for_box(text: &str, max_chars: usize) -> String {
     format!("{prefix}...")
 }
 
-fn format_box_border(top: bool) -> String {
-    let inner = "─".repeat(DASHBOARD_BOX_WIDTH.saturating_sub(2));
+fn truncate_middle_for_box(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+    let left = (max_chars - 3) / 2;
+    let right = max_chars.saturating_sub(3 + left);
+    let prefix = text.chars().take(left).collect::<String>();
+    let suffix = text
+        .chars()
+        .rev()
+        .take(right)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("{prefix}...{suffix}")
+}
+
+fn dashboard_box_width(cols: Option<usize>) -> usize {
+    let Some(cols) = cols else {
+        return DASHBOARD_BOX_WIDTH_DEFAULT;
+    };
+
+    let usable = cols.saturating_sub(2).max(4);
+    if usable < DASHBOARD_BOX_WIDTH_MIN {
+        usable
+    } else {
+        usable.clamp(DASHBOARD_BOX_WIDTH_MIN, DASHBOARD_BOX_WIDTH_MAX)
+    }
+}
+
+fn format_box_border_with_width(top: bool, box_width: usize) -> String {
+    let inner = "─".repeat(box_width.saturating_sub(2));
     if top {
         format!("┌{inner}┐")
     } else {
@@ -1762,11 +1890,24 @@ fn format_box_border(top: bool) -> String {
     }
 }
 
-fn format_box_line(content: &str) -> String {
-    let inner = DASHBOARD_BOX_WIDTH.saturating_sub(2);
+#[cfg(test)]
+fn format_box_border(top: bool) -> String {
+    format_box_border_with_width(top, DASHBOARD_BOX_WIDTH_DEFAULT)
+}
+
+fn format_box_line_with_width(content: &str, box_width: usize) -> String {
+    let inner = box_width.saturating_sub(2);
     let clipped = truncate_for_box(content, inner);
     let padding = " ".repeat(inner.saturating_sub(clipped.chars().count()));
     format!("│{clipped}{padding}│")
+}
+
+fn pick_dashboard_layout(rows: Option<usize>) -> DashboardLayout {
+    match rows {
+        Some(rows) if rows >= 20 => DashboardLayout::Full,
+        Some(rows) if rows >= 14 => DashboardLayout::Compact,
+        _ => DashboardLayout::Minimal,
+    }
 }
 
 fn read_tput_number(capability: &str) -> Option<usize> {
@@ -1819,6 +1960,83 @@ fn format_footer_status_line(progress_title: &str, width: usize) -> String {
     }
 }
 
+fn footer_input_rows(rows: usize) -> usize {
+    if rows >= 36 { 5 } else { 4 }
+}
+
+async fn reset_shell_surface(stdout: &mut tokio::io::Stdout) -> anyhow::Result<()> {
+    stdout
+        .write_all(b"\x1b[0m\x1b[?2004l\x1b[2J\x1b[H")
+        .await
+        .context("failed to clear commander shell surface")?;
+    stdout
+        .flush()
+        .await
+        .context("failed to flush commander shell surface")
+}
+
+fn normalize_shell_input(input: &str) -> String {
+    input
+        .replace(BRACKETED_PASTE_START, "")
+        .replace(BRACKETED_PASTE_END, "")
+}
+
+fn split_bracketed_paste_markers(input: &str) -> (bool, bool, String) {
+    let has_start = input.contains(BRACKETED_PASTE_START);
+    let has_end = input.contains(BRACKETED_PASTE_END);
+    (has_start, has_end, normalize_shell_input(input))
+}
+
+async fn read_shell_input_with_paste_support(
+    lines: &mut tokio::io::Lines<BufReader<tokio::io::Stdin>>,
+    first_line: String,
+) -> anyhow::Result<String> {
+    let (has_start, has_end, normalized) = split_bracketed_paste_markers(&first_line);
+    if !has_start {
+        return Ok(normalized);
+    }
+    if has_end {
+        return Ok(normalized);
+    }
+
+    if normalized.trim_start().starts_with('/') {
+        return Ok(normalized);
+    }
+
+        let mut collected = normalized;
+        let is_burst_collection = !has_start;
+
+    loop {
+            let next_line = if is_burst_collection {
+            match timeout(
+                std::time::Duration::from_millis(PASTE_BURST_IDLE_MS),
+                lines.next_line(),
+            )
+            .await
+            {
+                Ok(next) => next,
+                Err(_) => break,
+            }
+        } else {
+            lines.next_line().await
+        };
+
+        let Some(next) = next_line.context("failed to read pasted commander command")? else {
+            break;
+        };
+        let (_, end_found, cleaned) = split_bracketed_paste_markers(&next);
+        if !collected.is_empty() {
+            collected.push('\n');
+        }
+        collected.push_str(&cleaned);
+        if end_found {
+            break;
+        }
+    }
+
+    Ok(collected)
+}
+
 fn summarize_task_input(task: &str) -> String {
     let chars = task.chars().count();
     let lower = task.to_ascii_lowercase();
@@ -1836,8 +2054,40 @@ fn summarize_task_input(task: &str) -> String {
     }
 }
 
+fn append_image_marker_to_task(session: &mut CommanderSession, image_path: Option<&str>) -> String {
+    let image_count = session
+        .task
+        .as_deref()
+        .map(|task| task.matches("[Image #").count())
+        .unwrap_or(0)
+        + 1;
+    let marker = match image_path {
+        Some(path) => format!("[Image #{image_count}] {path}"),
+        None => format!("[Image #{image_count}]"),
+    };
+    let next_task = match session.task.take() {
+        None => marker.clone(),
+        Some(existing) if existing.trim().is_empty() => marker.clone(),
+        Some(existing) if existing.ends_with('\n') => format!("{existing}{marker}"),
+        Some(existing) => format!("{existing}\n{marker}"),
+    };
+    session.task = Some(next_task);
+    session.worker_outputs.clear();
+    refresh_session_worker_states(session);
+    marker
+}
+
+fn summarize_large_task_preview(task: &str) -> Option<String> {
+    let chars = task.chars().count();
+    if chars > PASTED_PREVIEW_MIN_CHARS {
+        Some(format!("[Pasted Content {chars} chars]"))
+    } else {
+        None
+    }
+}
+
 fn footer_tip_line() -> &'static str {
-    "Tip: run /task <text>; commander will auto-plan and auto-run."
+    "Tip: type task text directly; use /run when ready. /help for commands."
 }
 
 fn format_directory_for_display(path: &Path) -> String {
@@ -1862,29 +2112,52 @@ async fn render_bottom_console(
     let Some((rows, cols)) = terminal_dimensions() else {
         return Ok(false);
     };
-    if rows < 4 {
+    if rows < STYLED_FOOTER_MIN_ROWS || cols == 0 {
         return Ok(false);
     }
 
-    let tip_row = rows.saturating_sub(3).max(1);
-    let separator_row = rows.saturating_sub(2).max(1);
-    let prompt_row = rows.saturating_sub(1).max(1);
+    let input_rows = footer_input_rows(rows);
+    let reserved_rows = input_rows + 3; // tip + spacer + input + status
+    if rows < reserved_rows {
+        return Ok(false);
+    }
+
+    let tip_row = rows - reserved_rows + 1;
+    let spacer_row = tip_row + 1;
+    let input_top_row = spacer_row + 1;
+    let input_bottom_row = input_top_row + input_rows - 1;
+    let prompt_row = input_top_row + (input_rows.saturating_sub(1) / 2);
     let status_row = rows.max(1);
     let progress_title = format_progress_title(&session.worker_states);
     let tip_line = fit_text_to_width(footer_tip_line(), cols);
-    let separator_line = fit_text_to_width(&"─".repeat(cols), cols);
+    let spacer_line = fit_text_to_width("", cols);
+    let input_fill_line = fit_text_to_width("", cols);
     let prompt_prefix = format!(" {prompt}");
     let prompt_line = fit_text_to_width(&prompt_prefix, cols);
     let status_line = fit_text_to_width(&format_footer_status_line(&progress_title, cols), cols);
     let prompt_col = prompt_prefix.chars().count().min(cols.saturating_sub(1)) + 1;
 
-    let frame = format!(
-        "\x1b[{tip_row};1H\x1b[2K\x1b[38;5;255m{tip_line}\x1b[0m\
-\x1b[{separator_row};1H\x1b[2K\x1b[48;5;236m\x1b[38;5;245m{separator_line}\x1b[0m\
-\x1b[{prompt_row};1H\x1b[2K\x1b[48;5;236m\x1b[38;5;255m{prompt_line}\x1b[0m\
-\x1b[{status_row};1H\x1b[2K\x1b[48;5;234m\x1b[38;5;245m{status_line}\x1b[0m\
+    let mut frame = String::new();
+    frame.push_str(&format!(
+        "\x1b[{tip_row};1H\x1b[2K\x1b[38;5;255m{tip_line}\x1b[0m"
+    ));
+    frame.push_str(&format!("\x1b[{spacer_row};1H\x1b[2K{spacer_line}"));
+
+    for row in input_top_row..=input_bottom_row {
+        let line = if row == prompt_row {
+            &prompt_line
+        } else {
+            &input_fill_line
+        };
+        frame.push_str(&format!(
+            "\x1b[{row};1H\x1b[2K\x1b[48;5;236m\x1b[38;5;255m{line}\x1b[0m"
+        ));
+    }
+
+    frame.push_str(&format!(
+        "\x1b[{status_row};1H\x1b[2K\x1b[48;5;234m\x1b[38;5;245m{status_line}\x1b[0m\
 \x1b[48;5;236m\x1b[38;5;255m\x1b[{prompt_row};{prompt_col}H"
-    );
+    ));
     stdout
         .write_all(frame.as_bytes())
         .await
@@ -1897,17 +2170,29 @@ async fn render_bottom_console(
     Ok(true)
 }
 
+#[cfg(test)]
 fn format_shell_dashboard_lines(session: &CommanderSession) -> Vec<String> {
-    format_shell_dashboard_lines_with_mode(session, false)
+    format_shell_dashboard_lines_with_layout(
+        session,
+        DashboardLayout::Full,
+        DASHBOARD_BOX_WIDTH_DEFAULT,
+    )
 }
 
-fn format_shell_dashboard_lines_with_mode(session: &CommanderSession, compact: bool) -> Vec<String> {
+fn format_shell_dashboard_lines_with_layout(
+    session: &CommanderSession,
+    layout: DashboardLayout,
+    box_width: usize,
+) -> Vec<String> {
     let version = env!("CARGO_PKG_VERSION");
     let progress_title = format_progress_title(&session.worker_states);
-    let directory = std::env::current_dir()
+    let mut directory = std::env::current_dir()
         .ok()
         .map(|p| format_directory_for_display(&p))
         .unwrap_or_else(|| "<unknown>".to_string());
+    let inner = box_width.saturating_sub(2);
+    let directory_budget = inner.saturating_sub("directory: ".chars().count());
+    directory = truncate_middle_for_box(&directory, directory_budget);
     let model = session
         .run_config
         .model
@@ -1934,44 +2219,64 @@ fn format_shell_dashboard_lines_with_mode(session: &CommanderSession, compact: b
         "off"
     };
 
-    if compact {
-        return vec![
-            format_box_border(true),
-            format_box_line(&format!(">_ OpenAI Codex Commander (v{version})")),
-            format_box_line(""),
-            format_box_line(&format!("model:     {model}")),
-            format_box_line(&format!("directory: {directory}")),
-            format_box_line(&format!("worker:   {progress_title}")),
-            format_box_border(false),
-        ];
+    match layout {
+        DashboardLayout::Full => vec![
+            format_box_border_with_width(true, box_width),
+            format_box_line_with_width(
+                &format!(">_ OpenAI Codex Commander (v{version})"),
+                box_width,
+            ),
+            format_box_line_with_width("", box_width),
+            format_box_line_with_width(&format!("model:     {model}"), box_width),
+            format_box_line_with_width(&format!("directory: {directory}"), box_width),
+            format_box_line_with_width("", box_width),
+            format_box_line_with_width(&format!("worker:   {progress_title}"), box_width),
+            format_box_line_with_width(&format!("task:     {task_title}"), box_width),
+            format_box_line_with_width(
+                &format!(
+                    "workers:  {configured_workers} configured ({execution_workers} run order)"
+                ),
+                box_width,
+            ),
+            format_box_line_with_width(&format!("reviewer: {reviewer_state}"), box_width),
+            format_box_border_with_width(false, box_width),
+        ],
+        DashboardLayout::Compact => vec![
+            format_box_border_with_width(true, box_width),
+            format_box_line_with_width(
+                &format!(">_ OpenAI Codex Commander (v{version})"),
+                box_width,
+            ),
+            format_box_line_with_width("", box_width),
+            format_box_line_with_width(&format!("model:     {model}"), box_width),
+            format_box_line_with_width(&format!("directory: {directory}"), box_width),
+            format_box_line_with_width(&format!("worker:   {progress_title}"), box_width),
+            format_box_line_with_width(&format!("reviewer: {reviewer_state}"), box_width),
+            format_box_border_with_width(false, box_width),
+        ],
+        DashboardLayout::Minimal => vec![
+            format_box_border_with_width(true, box_width),
+            format_box_line_with_width(
+                &format!(">_ OpenAI Codex Commander (v{version})"),
+                box_width,
+            ),
+            format_box_line_with_width(&format!("model:     {model}"), box_width),
+            format_box_line_with_width(&format!("directory: {directory}"), box_width),
+            format_box_border_with_width(false, box_width),
+        ],
     }
-
-    vec![
-        format_box_border(true),
-        format_box_line(&format!(">_ OpenAI Codex Commander (v{version})")),
-        format_box_line(""),
-        format_box_line(&format!("model:     {model}")),
-        format_box_line(&format!("directory: {directory}")),
-        format_box_line(""),
-        format_box_line(&format!("worker:   {progress_title}")),
-        format_box_line(&format!("task:     {task_title}")),
-        format_box_line(&format!(
-            "workers:  {configured_workers} configured ({execution_workers} run order)"
-        )),
-        format_box_line(&format!("reviewer: {reviewer_state}")),
-        format_box_border(false),
-    ]
 }
 
 fn print_shell_dashboard(session: &CommanderSession) {
-    let compact = terminal_dimensions()
-        .map(|(rows, _)| rows <= 18)
-        .unwrap_or(false);
-    let lines = format_shell_dashboard_lines_with_mode(session, compact);
+    let dimensions = terminal_dimensions();
+    let layout = pick_dashboard_layout(dimensions.map(|(rows, _)| rows));
+    let box_width = dashboard_box_width(dimensions.map(|(_, cols)| cols));
+    let lines = format_shell_dashboard_lines_with_layout(session, layout, box_width);
     println!();
     for line in lines {
         println!("{line}");
     }
+    println!();
     println!();
 }
 
@@ -2416,6 +2721,10 @@ mod tests {
             parse_shell_command("/load"),
             CommanderShellCommand::UsageError("Usage: /load <path>".to_string())
         );
+        assert_eq!(
+            parse_shell_command("/image-paste now"),
+            CommanderShellCommand::UsageError("Usage: /image-paste".to_string())
+        );
     }
 
     #[test]
@@ -2431,6 +2740,56 @@ mod tests {
         assert_eq!(
             parse_shell_command("investigate live updater"),
             CommanderShellCommand::Task("investigate live updater".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_shell_command_parses_image_command() {
+        assert_eq!(
+            parse_shell_command("/image ./screen.png"),
+            CommanderShellCommand::AttachImage(Some("./screen.png".to_string()))
+        );
+        assert_eq!(
+            parse_shell_command("/attach-image /tmp/a.jpg"),
+            CommanderShellCommand::AttachImage(Some("/tmp/a.jpg".to_string()))
+        );
+        assert_eq!(
+            parse_shell_command("/attach-image"),
+            CommanderShellCommand::AttachImage(None)
+        );
+    }
+
+    #[test]
+    fn parse_shell_command_parses_clipboard_image_commands() {
+        assert_eq!(
+            parse_shell_command("/image"),
+            CommanderShellCommand::PasteClipboardImage
+        );
+        assert_eq!(
+            parse_shell_command("/image-paste"),
+            CommanderShellCommand::PasteClipboardImage
+        );
+        assert_eq!(
+            parse_shell_command("/paste-image"),
+            CommanderShellCommand::PasteClipboardImage
+        );
+    }
+
+    #[test]
+    fn normalize_shell_input_removes_bracketed_paste_markers() {
+        let input = "\u{1b}[200~fix this ts error\u{1b}[201~";
+        assert_eq!(normalize_shell_input(input), "fix this ts error");
+    }
+
+    #[test]
+    fn summarize_large_task_preview_only_for_content_over_50_chars() {
+        assert_eq!(summarize_large_task_preview("small task"), None);
+        let exact = "x".repeat(PASTED_PREVIEW_MIN_CHARS);
+        assert_eq!(summarize_large_task_preview(&exact), None);
+        let long = "x".repeat(PASTED_PREVIEW_MIN_CHARS + 1);
+        assert_eq!(
+            summarize_large_task_preview(&long),
+            Some("[Pasted Content 51 chars]".to_string())
         );
     }
 
